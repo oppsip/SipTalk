@@ -1,8 +1,9 @@
-#include "SipCore.hpp"
+﻿#include "SipCore.hpp"
 
 #include "SipCommandQueue.hpp"
 
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <stdexcept>
 #include <sstream>
@@ -108,6 +109,15 @@ std::string json_call_payload(
     return payload.str();
 }
 
+std::string json_diagnostic_payload(
+    const std::string& level,
+    const std::string& message)
+{
+    std::ostringstream payload;
+    payload << "{\"level\":\"" << level << "\",\"message\":\"" << json_escape(message) << "\"}";
+    return payload.str();
+}
+
 #if defined(SIPTALK_HAS_PJSIP)
 std::string call_state_for(pjsip_inv_state state, pjsip_status_code lastStatusCode)
 {
@@ -136,8 +146,9 @@ public:
         pj::Account& account,
         std::string accountId,
         std::string appCallId,
-        SipEventHandler eventHandler)
-        : pj::Call(account)
+        SipEventHandler eventHandler,
+        int pjCallId = PJSUA_INVALID_ID)
+        : pj::Call(account, pjCallId)
         , accountId_(std::move(accountId))
         , appCallId_(std::move(appCallId))
         , eventHandler_(std::move(eventHandler))
@@ -171,7 +182,99 @@ public:
         }
     }
 
+    void onCallMediaState(pj::OnCallMediaStateParam& prm) override
+    {
+        PJ_UNUSED_ARG(prm);
+
+        try {
+            const pj::CallInfo info = getInfo();
+            for (const auto& media : info.media) {
+                if (media.type != PJMEDIA_TYPE_AUDIO || media.status != PJSUA_CALL_MEDIA_ACTIVE) {
+                    continue;
+                }
+
+                auto* audioMedia = static_cast<pj::AudioMedia*>(getMedia(media.index));
+                if (audioMedia == nullptr) {
+                    continue;
+                }
+
+                auto& endpoint = pj::Endpoint::instance();
+                auto& audioManager = endpoint.audDevManager();
+                audioMedia->startTransmit(audioManager.getPlaybackDevMedia());
+                audioManager.getCaptureDevMedia().startTransmit(*audioMedia);
+
+                if (eventHandler_) {
+                    emitMediaDiagnostics(media.index, *audioMedia, "info", "Audio media connected");
+                    return;
+                }
+                return;
+            }
+
+            if (eventHandler_) {
+                eventHandler_({
+                    "DiagnosticLog",
+                    accountId_,
+                    appCallId_,
+                    json_diagnostic_payload("warning", "No active audio media in call"),
+                });
+            }
+        } catch (const pj::Error& error) {
+            if (eventHandler_) {
+                eventHandler_({
+                    "DiagnosticLog",
+                    accountId_,
+                    appCallId_,
+                    json_diagnostic_payload("error", "Failed to connect audio media: " + error.info()),
+                });
+            }
+        } catch (const std::exception& error) {
+            if (eventHandler_) {
+                eventHandler_({
+                    "DiagnosticLog",
+                    accountId_,
+                    appCallId_,
+                    json_diagnostic_payload("error", "Failed to connect audio media: " + std::string(error.what())),
+                });
+            }
+        }
+    }
+
 private:
+    void emitMediaDiagnostics(unsigned mediaIndex, pj::AudioMedia& audioMedia, const std::string& level, const std::string& prefix)
+    {
+        try {
+            auto& audioManager = pj::Endpoint::instance().audDevManager();
+            const auto portInfo = audioMedia.getPortInfo();
+            const auto transportInfo = getMedTransportInfo(mediaIndex);
+            const auto streamStat = getStreamStat(mediaIndex);
+
+            std::ostringstream message;
+            message << prefix
+                    << "; sndActive=" << (audioManager.sndIsActive() ? "true" : "false")
+                    << "; port=" << portInfo.portId << " " << portInfo.name
+                    << "; listeners=" << portInfo.listeners.size()
+                    << "; localRtp=" << transportInfo.localRtpName
+                    << "; srcRtp=" << transportInfo.srcRtpName
+                    << "; txPkt=" << streamStat.rtcp.txStat.pkt
+                    << "; rxPkt=" << streamStat.rtcp.rxStat.pkt
+                    << "; rxLoss=" << streamStat.rtcp.rxStat.loss;
+
+            eventHandler_({
+                "DiagnosticLog",
+                accountId_,
+                appCallId_,
+                json_diagnostic_payload(level, message.str()),
+            });
+        } catch (const pj::Error& error) {
+            eventHandler_({
+                "DiagnosticLog",
+                accountId_,
+                appCallId_,
+                json_diagnostic_payload("warning", prefix + "; media diagnostics failed: " + error.info()),
+            });
+        }
+    }
+
     std::string accountId_;
     std::string appCallId_;
     SipEventHandler eventHandler_;
@@ -179,10 +282,23 @@ private:
 
 class ManagedAccount : public pj::Account {
 public:
-    ManagedAccount(std::string accountId, SipEventHandler eventHandler)
+    using IncomingCallHandler = std::function<void(pj::Account&, int)>;
+
+    ManagedAccount(
+        std::string accountId,
+        SipEventHandler eventHandler,
+        IncomingCallHandler incomingCallHandler)
         : accountId_(std::move(accountId))
         , eventHandler_(std::move(eventHandler))
+        , incomingCallHandler_(std::move(incomingCallHandler))
     {
+    }
+
+    void onIncomingCall(pj::OnIncomingCallParam& prm) override
+    {
+        if (incomingCallHandler_) {
+            incomingCallHandler_(*this, prm.callId);
+        }
     }
 
     void onRegState(pj::OnRegStateParam& prm) override
@@ -209,6 +325,7 @@ public:
 private:
     std::string accountId_;
     SipEventHandler eventHandler_;
+    IncomingCallHandler incomingCallHandler_;
 };
 #endif
 
@@ -238,6 +355,7 @@ public:
 
 #if defined(SIPTALK_HAS_PJSIP)
     std::unique_ptr<pj::Endpoint> endpoint;
+    std::mutex pjsipMutex;
     std::unordered_map<std::string, std::unique_ptr<ManagedAccount>> pjsipAccounts;
     std::unordered_map<std::string, std::unique_ptr<ManagedCall>> pjsipCalls;
 #endif
@@ -384,6 +502,44 @@ void SipCore::registerAccount(const std::string& accountId)
                 accountId,
                 [this](const SipEvent& event) {
                     impl_->emit(event);
+                },
+                [this, accountId](pj::Account& account, int pjCallId) {
+                    const auto callId = std::to_string(impl_->nextCallId.fetch_add(1));
+                    auto call = std::make_unique<ManagedCall>(
+                        account,
+                        accountId,
+                        callId,
+                        [this](const SipEvent& event) {
+                            impl_->emit(event);
+                        },
+                        pjCallId);
+
+                    std::string remoteUri;
+                    try {
+                        remoteUri = call->getInfo().remoteUri;
+                        pj::CallOpParam ringingParam;
+                        ringingParam.statusCode = PJSIP_SC_RINGING;
+                        call->answer(ringingParam);
+                    } catch (const pj::Error& error) {
+                        impl_->emit({
+                            "DiagnosticLog",
+                            accountId,
+                            callId,
+                            json_diagnostic_payload("warning", "Incoming call setup warning: " + error.info()),
+                        });
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(impl_->pjsipMutex);
+                        impl_->pjsipCalls[callId] = std::move(call);
+                    }
+
+                    impl_->emit({
+                        "IncomingCall",
+                        accountId,
+                        callId,
+                        json_call_payload("IncomingSip", remoteUri, "", 0),
+                    });
                 });
 
             pj::AccountConfig accountConfig;
@@ -485,7 +641,10 @@ std::string SipCore::makeCall(const std::string& accountId, const std::string& d
                 });
             pj::CallOpParam callParam(true);
             call->makeCall(destinationUri, callParam);
-            impl_->pjsipCalls[callId] = std::move(call);
+            {
+                std::lock_guard<std::mutex> lock(impl_->pjsipMutex);
+                impl_->pjsipCalls[callId] = std::move(call);
+            }
         } catch (const pj::Error& error) {
             impl_->emit({
                 "CallStateChanged",
@@ -516,6 +675,26 @@ std::string SipCore::makeCall(const std::string& accountId, const std::string& d
 void SipCore::answerCall(const std::string& callId)
 {
     impl_->commandQueue.post([this, callId] {
+#if defined(SIPTALK_HAS_PJSIP)
+        std::lock_guard<std::mutex> lock(impl_->pjsipMutex);
+        auto found = impl_->pjsipCalls.find(callId);
+        if (found != impl_->pjsipCalls.end()) {
+            try {
+                pj::CallOpParam param(true);
+                param.statusCode = PJSIP_SC_OK;
+                found->second->answer(param);
+                return;
+            } catch (const pj::Error& error) {
+                impl_->emit({
+                    "CallStateChanged",
+                    "",
+                    callId,
+                    json_call_payload("Failed", "", error.info(), 0),
+                });
+                return;
+            }
+        }
+#endif
         impl_->emit({"CallStateChanged", "", callId, "{\"state\":\"Connecting\"}"});
     });
 }
@@ -523,6 +702,19 @@ void SipCore::answerCall(const std::string& callId)
 void SipCore::rejectCall(const std::string& callId)
 {
     impl_->commandQueue.post([this, callId] {
+#if defined(SIPTALK_HAS_PJSIP)
+        std::lock_guard<std::mutex> lock(impl_->pjsipMutex);
+        auto found = impl_->pjsipCalls.find(callId);
+        if (found != impl_->pjsipCalls.end()) {
+            try {
+                pj::CallOpParam param;
+                param.statusCode = PJSIP_SC_BUSY_HERE;
+                found->second->answer(param);
+            } catch (...) {
+            }
+            impl_->pjsipCalls.erase(found);
+        }
+#endif
         impl_->emit({"CallStateChanged", "", callId, "{\"state\":\"Ended\",\"reason\":\"Rejected\"}"});
     });
 }
@@ -531,6 +723,7 @@ void SipCore::hangupCall(const std::string& callId)
 {
     impl_->commandQueue.post([this, callId] {
 #if defined(SIPTALK_HAS_PJSIP)
+        std::lock_guard<std::mutex> lock(impl_->pjsipMutex);
         auto found = impl_->pjsipCalls.find(callId);
         if (found != impl_->pjsipCalls.end()) {
             try {

@@ -6,6 +6,7 @@ import 'sip/sip_call.dart';
 import 'sip/sip_controller.dart';
 import 'sip/sip_event.dart';
 import 'sip/sip_method_channel_controller.dart';
+import 'sip/sip_profile_store.dart';
 
 void main() {
   runApp(const SipTalkApp());
@@ -30,36 +31,50 @@ class SipTalkApp extends StatelessWidget {
 }
 
 class SipHomePage extends StatefulWidget {
-  const SipHomePage({required this.controller, super.key});
+  const SipHomePage({
+    required this.controller,
+    this.profileStore = const SipProfileStore(),
+    super.key,
+  });
 
   final SipController controller;
+  final SipProfileStore profileStore;
 
   @override
   State<SipHomePage> createState() => _SipHomePageState();
 }
 
 class _SipHomePageState extends State<SipHomePage> {
-  final _domainController = TextEditingController(text: 'sip.example.com');
-  final _usernameController = TextEditingController(text: '1000');
-  final _passwordController = TextEditingController(text: 'change-me');
+  final _domainController = TextEditingController();
+  final _usernameController = TextEditingController();
+  final _passwordController = TextEditingController();
   final _authUsernameController = TextEditingController();
   final _proxyController = TextEditingController();
-  final _expiresController = TextEditingController(text: '300');
-  final _destinationController = TextEditingController(text: '1001');
+  final _expiresController = TextEditingController();
+  final _destinationController = TextEditingController();
   final _events = <String>[];
+  final _profileSaveListeners = <TextEditingController, VoidCallback>{};
   String? _activeCallId;
   SipAudioRoute _route = SipAudioRoute.receiver;
   SipTransport _transport = SipTransport.udp;
+  bool _profileLoaded = false;
+  bool _applyingProfile = false;
 
   @override
   void initState() {
     super.initState();
+    _applyProfile(const SipProfile.defaults());
+    _installProfileSaveListeners();
+    _loadProfile();
     widget.controller.events.listen(_handleEvent);
     widget.controller.initialize();
   }
 
   @override
   void dispose() {
+    for (final entry in _profileSaveListeners.entries) {
+      entry.key.removeListener(entry.value);
+    }
     _domainController.dispose();
     _usernameController.dispose();
     _passwordController.dispose();
@@ -69,6 +84,66 @@ class _SipHomePageState extends State<SipHomePage> {
     _destinationController.dispose();
     widget.controller.shutdown();
     super.dispose();
+  }
+
+  Future<void> _loadProfile() async {
+    final profile = await widget.profileStore.load();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _applyProfile(profile);
+      _profileLoaded = true;
+    });
+  }
+
+  void _applyProfile(SipProfile profile) {
+    _applyingProfile = true;
+    _domainController.text = profile.domain;
+    _usernameController.text = profile.username;
+    _passwordController.text = profile.password;
+    _authUsernameController.text = profile.authUsername;
+    _proxyController.text = profile.proxy;
+    _expiresController.text = profile.expires;
+    _destinationController.text = profile.destination;
+    _transport = profile.transport;
+    _applyingProfile = false;
+  }
+
+  void _installProfileSaveListeners() {
+    for (final controller in [
+      _domainController,
+      _usernameController,
+      _passwordController,
+      _authUsernameController,
+      _proxyController,
+      _expiresController,
+      _destinationController,
+    ]) {
+      void listener() => _saveProfile();
+      _profileSaveListeners[controller] = listener;
+      controller.addListener(listener);
+    }
+  }
+
+  Future<void> _saveProfile() async {
+    if (_applyingProfile) {
+      return;
+    }
+    await widget.profileStore.save(_currentProfile());
+  }
+
+  SipProfile _currentProfile() {
+    return SipProfile(
+      domain: _domainController.text,
+      username: _usernameController.text,
+      password: _passwordController.text,
+      authUsername: _authUsernameController.text,
+      proxy: _proxyController.text,
+      transport: _transport,
+      expires: _expiresController.text,
+      destination: _destinationController.text,
+    );
   }
 
   void _handleEvent(SipEvent event) {
@@ -125,6 +200,7 @@ class _SipHomePageState extends State<SipHomePage> {
   }
 
   Future<void> _register() async {
+    await _saveProfile();
     final domain = _domainController.text.trim();
     final username = _usernameController.text.trim();
     final password = _passwordController.text;
@@ -172,6 +248,29 @@ class _SipHomePageState extends State<SipHomePage> {
       return;
     }
     await widget.controller.hangupCall(callId);
+  }
+
+  Future<void> _answer() async {
+    final callId = _activeCallId;
+    if (callId == null) {
+      return;
+    }
+    try {
+      await widget.controller.answerCall(callId);
+    } on PlatformException catch (error) {
+      setState(
+        () =>
+            _events.insert(0, 'Answer failed: ${error.message ?? error.code}'),
+      );
+    }
+  }
+
+  Future<void> _reject() async {
+    final callId = _activeCallId;
+    if (callId == null) {
+      return;
+    }
+    await widget.controller.rejectCall(callId);
   }
 
   Future<void> _toggleSpeaker() async {
@@ -262,6 +361,7 @@ class _SipHomePageState extends State<SipHomePage> {
                 children: [
                   Expanded(
                     child: DropdownButtonFormField<SipTransport>(
+                      key: ValueKey(_transport),
                       initialValue: _transport,
                       decoration: const InputDecoration(
                         labelText: 'Transport',
@@ -279,6 +379,7 @@ class _SipHomePageState extends State<SipHomePage> {
                       onChanged: (transport) {
                         if (transport != null) {
                           setState(() => _transport = transport);
+                          _saveProfile();
                         }
                       },
                     ),
@@ -338,9 +439,24 @@ class _SipHomePageState extends State<SipHomePage> {
                     icon: const Icon(Icons.call_end),
                     label: const Text('Hang up'),
                   ),
+                  FilledButton.icon(
+                    onPressed: _answer,
+                    icon: const Icon(Icons.call_received),
+                    label: const Text('Answer'),
+                  ),
+                  FilledButton.tonalIcon(
+                    onPressed: _reject,
+                    icon: const Icon(Icons.phone_disabled),
+                    label: const Text('Reject'),
+                  ),
                 ],
               ),
               const SizedBox(height: 16),
+              if (!_profileLoaded)
+                const LinearProgressIndicator(minHeight: 2)
+              else
+                const SizedBox(height: 2),
+              const SizedBox(height: 8),
               Expanded(
                 child: DecoratedBox(
                   decoration: BoxDecoration(

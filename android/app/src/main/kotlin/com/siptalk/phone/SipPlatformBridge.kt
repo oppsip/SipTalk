@@ -85,7 +85,20 @@ class SipPlatformBridge(private val context: Context) : MethodChannel.MethodCall
                 result.success(callId)
             }
             "answerCall" -> {
+                if (!hasRecordAudioPermission()) {
+                    (context as? Activity)?.requestPermissions(
+                        arrayOf(Manifest.permission.RECORD_AUDIO),
+                        1002,
+                    )
+                    result.error(
+                        "audio_permission_denied",
+                        "Microphone permission is required before answering a SIP call",
+                        null,
+                    )
+                    return
+                }
                 val callId = call.argument<String>("callId").orEmpty()
+                audioRouteManager.prepareForCall()
                 native.answerCall(callId)
                 result.success(null)
             }
