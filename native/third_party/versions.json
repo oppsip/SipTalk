@@ -1,0 +1,14 @@
+{
+  "pjsip": {
+    "repo": "https://github.com/pjsip/pjproject.git",
+    "tag": "2.17",
+    "tagObject": "6852b24c0d07219a06130ae982320942241eee49",
+    "commit": "5a457451fa2712ba18e12b01738e8ff3af2b26fd"
+  },
+  "android": {
+    "ndkVersion": "28.2.13676358",
+    "cmakeVersion": "3.22.1",
+    "defaultAbi": "arm64-v8a",
+    "defaultApiLevel": 28
+  }
+}
