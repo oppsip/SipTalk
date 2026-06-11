@@ -20,6 +20,30 @@ class SipCallInfo {
   final DateTime? endedAt;
   final String? failureReason;
   final int? statusCode;
+
+  SipCallInfo copyWith({
+    String? id,
+    String? accountId,
+    SipCallState? state,
+    String? remoteUri,
+    String? displayName,
+    DateTime? startedAt,
+    DateTime? endedAt,
+    String? failureReason,
+    int? statusCode,
+  }) {
+    return SipCallInfo(
+      id: id ?? this.id,
+      accountId: accountId ?? this.accountId,
+      state: state ?? this.state,
+      remoteUri: remoteUri ?? this.remoteUri,
+      displayName: displayName ?? this.displayName,
+      startedAt: startedAt ?? this.startedAt,
+      endedAt: endedAt ?? this.endedAt,
+      failureReason: failureReason ?? this.failureReason,
+      statusCode: statusCode ?? this.statusCode,
+    );
+  }
 }
 
 enum SipCallState {

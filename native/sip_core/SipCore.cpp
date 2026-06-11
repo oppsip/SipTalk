@@ -549,6 +549,11 @@ void SipCore::registerAccount(const std::string& accountId)
             accountConfig.regConfig.timeoutSec = static_cast<unsigned>(config.registrationExpiresSeconds);
             accountConfig.regConfig.retryIntervalSec = 60;
             accountConfig.regConfig.firstRetryIntervalSec = 10;
+            accountConfig.natConfig.contactRewriteUse = 1;
+            accountConfig.natConfig.viaRewriteUse = 1;
+            accountConfig.natConfig.sipOutboundUse = 1;
+            accountConfig.natConfig.udpKaIntervalSec = 15;
+            accountConfig.natConfig.udpKaData = "\r\n";
 
             const auto authUsername = config.authUsername.empty() ? config.username : config.authUsername;
             accountConfig.sipConfig.authCreds.push_back(
@@ -710,9 +715,22 @@ void SipCore::rejectCall(const std::string& callId)
                 pj::CallOpParam param;
                 param.statusCode = PJSIP_SC_BUSY_HERE;
                 found->second->answer(param);
-            } catch (...) {
+            } catch (const pj::Error& error) {
+                impl_->emit({
+                    "DiagnosticLog",
+                    "",
+                    callId,
+                    json_diagnostic_payload("warning", "Reject failed: " + error.info()),
+                });
             }
             impl_->pjsipCalls.erase(found);
+        } else {
+            impl_->emit({
+                "DiagnosticLog",
+                "",
+                callId,
+                json_diagnostic_payload("warning", "Reject failed: call not found"),
+            });
         }
 #endif
         impl_->emit({"CallStateChanged", "", callId, "{\"state\":\"Ended\",\"reason\":\"Rejected\"}"});
